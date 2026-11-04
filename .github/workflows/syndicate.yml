@@ -1,0 +1,59 @@
+name: syndicate
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  repository_dispatch:
+    types: [telegram_update]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "hunt | webhook | tick"
+        default: "hunt"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: syndicate
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: syndicate-state-restore-${{ github.run_id }}
+          restore-keys: |
+            syndicate-state-
+
+      - name: Jalankan Dewan
+        run: python main.py "$MODE"
+        env:
+          MODE: ${{ github.event_name == 'repository_dispatch' && 'webhook' || github.event.inputs.mode || 'hunt' }}
+          UPDATE_JSON: ${{ toJson(github.event.client_payload.update) }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          HUNT_QUERIES: ${{ vars.HUNT_QUERIES }}
+          ANOMALY_KEYWORDS: ${{ vars.ANOMALY_KEYWORDS }}
+          PRICE_TARGETS: ${{ vars.PRICE_TARGETS }}
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: syndicate-state-${{ github.run_id }}
