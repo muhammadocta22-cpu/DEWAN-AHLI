@@ -2,4 +2,4 @@
   publish = "public"
 
 [functions]
-  directory = "netlify/functions"
+  directory = "netlify/functions/telegram.js"
