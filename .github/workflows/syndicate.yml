@@ -3,6 +3,7 @@ name: syndicate
 on:
   schedule:
     - cron: "*/30 * * * *"        # Hunter + tugas proaktif tiap 30 menit (repo WAJIB Public; kalau Private ganti ke "17 */3 * * *")
+    - cron: "23 2 * * *"          # pemeriksa harian untuk keepalive
   repository_dispatch:
     types: [telegram_update]      # pesan Bos masuk lewat gateway Netlify
   workflow_dispatch:
@@ -60,3 +61,25 @@ jobs:
         with:
           path: state
           key: syndicate-state-${{ github.run_id }}
+
+  # Repo publik yang sepi 60 hari akan dimatikan jadwalnya oleh GitHub.
+  # Job ini membuat satu commit kosong bila commit terakhir sudah lebih dari 40 hari.
+  keepalive:
+    if: github.event.schedule == '23 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Jaga jadwal Dewan tetap hidup
+        continue-on-error: true
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt $((40*86400)) ]; then
+            git config user.name "syndicate-bot"
+            git config user.email "syndicate-bot@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: jaga jadwal Dewan tetap aktif"
+            git push
+          fi
