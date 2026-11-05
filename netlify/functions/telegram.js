@@ -1,3 +1,5 @@
+// Gerbang Syndicate: Telegram -> Netlify -> GitHub Actions.
+// Menolak semua yang bukan dari Telegram asli & bukan dari Bos.
 exports.handler = async (event) => {
   const OK = { statusCode: 200, body: "ok" };
   try {
@@ -21,6 +23,7 @@ exports.handler = async (event) => {
         body: JSON.stringify(payload),
       }).catch(() => null);
 
+    // Mode setup: OWNER_CHAT_ID belum diisi -> bot memberi tahu chat ID Bos
     const owner = String(process.env.OWNER_CHAT_ID || "").trim();
     if (!owner) {
       await tg("sendMessage", {
@@ -29,14 +32,15 @@ exports.handler = async (event) => {
       });
       return OK;
     }
-    if (String(chatId) !== owner) return OK;
+    if (String(chatId) !== owner) return OK; // orang asing diabaikan total
 
+    // Umpan balik instan agar Bos tidak menunggu dalam gelap
     if (update.callback_query) {
       await tg("answerCallbackQuery", {
         callback_query_id: update.callback_query.id,
         text: "Titah diterima. Dewan memproses...",
       });
-    } else if (update.message && update.message.text) {
+    } else if (update.message && (update.message.text || update.message.photo)) {
       await tg("sendChatAction", { chat_id: chatId, action: "typing" });
     } else {
       return OK;
@@ -65,6 +69,6 @@ exports.handler = async (event) => {
     }
     return OK;
   } catch (e) {
-    return OK;
+    return OK; // selalu 200 supaya Telegram tidak mengulang kiriman
   }
 };
