@@ -223,6 +223,20 @@ class LLMError(RuntimeError):
 
 _client: Optional[genai.Client] = None
 
+# Urutan model yang dicoba (model pilihan di GEMINI_MODEL selalu dicoba paling dulu)
+_MODEL_FALLBACKS = [
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-2.0-flash",
+]
+_BAD_WORDS = ("image", "tts", "live", "audio", "embedding", "robotics", "computer",
+              "learnlm", "gemma", "aqa", "imagen", "veo", "thinking", "exp")
+_dead_models: set = set()           # model yang ditolak (404/400) selama run ini
+_good_model: Optional[str] = None   # model terakhir yang berhasil
+_discovered: Optional[list] = None
+
 
 def _get_client() -> genai.Client:
     global _client
@@ -233,31 +247,111 @@ def _get_client() -> genai.Client:
     return _client
 
 
+def _err_code(exc: Exception) -> Optional[int]:
+    for attr in ("code", "status_code"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int):
+            return val
+    return None
+
+
+def _discover_models() -> list:
+    """Tanya Google model Flash apa saja yang tersedia untuk key ini (cadangan terakhir)."""
+    global _discovered
+    if _discovered is not None:
+        return _discovered
+    found: list = []
+    try:
+        for m in _get_client().models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "flash" not in name or any(w in name for w in _BAD_WORDS):
+                continue
+            if actions and "generateContent" not in actions:
+                continue
+            found.append(name)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Gagal menelusuri daftar model: %s", type(exc).__name__)
+
+    def ver(n: str) -> float:
+        mm = re.search(r"(\d+(?:\.\d+)?)", n)
+        return float(mm.group(1)) if mm else 0.0
+
+    found.sort(key=lambda n: (-ver(n), "preview" in n, "lite" in n, len(n)))
+    _discovered = found
+    log.info("Model hasil penelusuran: %d", len(found))
+    return found
+
+
+def _candidates() -> list:
+    order = ([_good_model] if _good_model else []) + ([GEMINI_MODEL] if GEMINI_MODEL else []) \
+        + _MODEL_FALLBACKS
+    out: list = []
+    for n in order:
+        if n and n not in out and n not in _dead_models:
+            out.append(n)
+    return out
+
+
 def call_llm(system: str, prompt: str, temperature: float = 0.8,
-             max_tokens: int = 4096, retries: int = 4) -> str:
+             max_tokens: int = 4096, retries: int = 3) -> str:
+    """Panggil Gemini; otomatis pindah model bila ditolak/habis kuota."""
+    global _good_model
     last_err = "tidak diketahui"
-    for attempt in range(retries):
-        try:
-            resp = _get_client().models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=gtypes.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                ),
-            )
-            text = (resp.text or "").strip()
-            if not text:
-                raise LLMError("respons kosong/diblokir")
-            return text
-        except Exception as exc:  # noqa: BLE001
-            last_err = f"{type(exc).__name__}"
-            delay = min(3 * (2 ** attempt), 45) + random.random()
-            log.warning("LLM gagal (%s), percobaan %d/%d, tunggu %.1fs",
-                        last_err, attempt + 1, retries, delay)
-            time.sleep(delay)
-    raise LLMError(f"Gemini tidak merespons setelah {retries} percobaan ({last_err}).")
+    queue = _candidates()
+    discovery_done = False
+    while True:
+        if not queue:
+            if discovery_done:
+                break
+            discovery_done = True
+            queue = [n for n in _discover_models() if n not in _dead_models]
+            if not queue:
+                break
+        model = queue.pop(0)
+        for attempt in range(retries):
+            try:
+                resp = _get_client().models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=gtypes.GenerateContentConfig(
+                        system_instruction=system,
+                        temperature=temperature,
+                        max_output_tokens=max_tokens,
+                    ),
+                )
+                text = (resp.text or "").strip()
+                if not text:
+                    raise LLMError("respons kosong/diblokir")
+                if _good_model != model:
+                    log.info("Model aktif: %s", model)
+                _good_model = model
+                return text
+            except LLMError as exc:
+                if "belum diset" in str(exc):
+                    raise
+                last_err = f"respons kosong [{model}]"
+                time.sleep(2 + random.random())
+            except Exception as exc:  # noqa: BLE001
+                code = _err_code(exc)
+                last_err = f"{type(exc).__name__} {code or ''} [{model}]".replace("  ", " ")
+                if code in (401, 403) or (code == 400 and "api key" in str(exc).lower()):
+                    raise LLMError(
+                        f"Kunci Gemini ditolak (kode {code}). Periksa secret GEMINI_API_KEY."
+                    ) from None
+                if code in (400, 404):
+                    _dead_models.add(model)
+                    log.warning("Model %s ditolak (%s), pindah model.", model, code)
+                    break
+                if code == 429:
+                    log.warning("Model %s kena batas kuota, pindah model.", model)
+                    time.sleep(3 + random.random())
+                    break
+                delay = min(3 * (2 ** attempt), 30) + random.random()
+                log.warning("LLM gagal (%s), percobaan %d/%d, tunggu %.1fs",
+                            last_err, attempt + 1, retries, delay)
+                time.sleep(delay)
+    raise LLMError(f"Gemini tidak merespons ({last_err}).")
 
 
 def clean(text: str) -> str:
