@@ -2,9 +2,9 @@ name: syndicate
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "*/30 * * * *"        # Hunter + tugas proaktif tiap 30 menit (repo WAJIB Public; kalau Private ganti ke "17 */3 * * *")
   repository_dispatch:
-    types: [telegram_update]
+    types: [telegram_update]      # pesan Bos masuk lewat gateway Netlify
   workflow_dispatch:
     inputs:
       mode:
@@ -16,12 +16,12 @@ permissions:
 
 concurrency:
   group: syndicate
-  cancel-in-progress: false
+  cancel-in-progress: false       # jangan ada 2 sidang berebut memori
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +43,6 @@ jobs:
         run: python main.py "$MODE"
         env:
           MODE: ${{ github.event_name == 'repository_dispatch' && 'webhook' || github.event.inputs.mode || 'hunt' }}
-          UPDATE_JSON: ${{ toJson(github.event.client_payload.update) }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -51,6 +50,10 @@ jobs:
           HUNT_QUERIES: ${{ vars.HUNT_QUERIES }}
           ANOMALY_KEYWORDS: ${{ vars.ANOMALY_KEYWORDS }}
           PRICE_TARGETS: ${{ vars.PRICE_TARGETS }}
+          QUIET_HOURS: ${{ vars.QUIET_HOURS }}
+          TRIAGE_MIN: ${{ vars.TRIAGE_MIN }}
+          MAX_HUNT_SIDANG_PER_DAY: ${{ vars.MAX_HUNT_SIDANG_PER_DAY }}
+          SCOUT_ENABLED: ${{ vars.SCOUT_ENABLED }}
 
       - uses: actions/cache/save@v4
         if: always()
