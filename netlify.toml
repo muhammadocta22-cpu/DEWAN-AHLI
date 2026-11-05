@@ -1,5 +1,5 @@
-[build]
-  publish = "public"
+   [build]
+     publish = "public"
 
-[functions]
-  directory = "netlify/functions/telegram.js"
+   [functions]
+     directory = "netlify/functions"
