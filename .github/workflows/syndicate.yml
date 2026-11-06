@@ -55,6 +55,8 @@ jobs:
           TRIAGE_MIN: ${{ vars.TRIAGE_MIN }}
           MAX_HUNT_SIDANG_PER_DAY: ${{ vars.MAX_HUNT_SIDANG_PER_DAY }}
           SCOUT_ENABLED: ${{ vars.SCOUT_ENABLED }}
+          INISIATIF_ENABLED: ${{ vars.INISIATIF_ENABLED }}
+          INISIATIF_JAM: ${{ vars.INISIATIF_JAM }}
 
       - uses: actions/cache/save@v4
         if: always()
