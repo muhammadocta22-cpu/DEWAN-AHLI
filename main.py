@@ -107,6 +107,8 @@ HUNT_HN = _flag_env("HUNT_HN", True)
 HUNT_TRENDS = _flag_env("HUNT_TRENDS", True)
 HUNT_PH = _flag_env("HUNT_PH", True)
 FOLLOWUP_DAYS = _int_env("FOLLOWUP_DAYS", 3)
+INISIATIF_ENABLED = _flag_env("INISIATIF_ENABLED", True)   # Dewan ngumpul sendiri dan lapor ke Bos
+INISIATIF_JAM = _int_env("INISIATIF_JAM", 24)              # rata-rata jeda antar inisiatif (acak 0,75x sampai 1,5x)
 MAX_PROFILE = 30
 MAX_RADAR = 30
 
@@ -284,6 +286,24 @@ Bos mengirim gambar (brosur, poster, struk, daftar harga, produk, etalase pesain
 - LANGKAH BERIKUTNYA: satu aksi konkret.
 Kalau ada bagian gambar yang tidak terbaca jelas, bilang jujur. Jangan menebak angka yang tidak terlihat."""
 
+NARRATOR_PROMPT = DOCTRINE + """
+PERANMU: JURU BICARA DEWAN.
+Bos tidak meminta apa-apa, tapi Dewan berkumpul sendiri karena memikirkan kemajuan Bos. Tulis laporan bergaya obrolan hangat, seolah para anggota Dewan ngumpul, ngobrol, lalu kamu menyampaikan hasilnya ke Bos. Boleh menyebut nama anggota (Visionary, Paranoid, Hustler, Treasurer) dan satu dua adegan singkat, misalnya Paranoid sempat ngeyel soal risiko lalu akhirnya setuju dengan syarat tertentu.
+
+Laporan harus memuat hal-hal ini dengan alur yang mengalir (bukan daftar kaku):
+1. Apa yang kami bahas dan kenapa sekarang.
+2. Potensinya buat Bos.
+3. Perkiraan hasil. Angka hanya dari data Treasurer atau Scout, pertahankan label [ASUMSI], dan jangan menjanjikan hasil pasti.
+4. Cara kerjanya.
+5. Yang Bos tinggal lakukan: maksimal 3 langkah, langkah pertama di bawah 15 menit.
+6. Yang kami khawatirkan beserta penangkalnya. Kekhawatiran harus jujur dan berdasar risiko nyata dari rapat, bukan drama.
+7. Penutup hangat satu kalimat.
+
+Aturan:
+- Jangan mengarang fakta di luar bahan rapat.
+- Sampaikan vonis Hakim apa adanya. Kalau TUNDA atau TOLAK, jelaskan alasannya dan apa yang bisa Bos siapkan.
+- Maksimal sekitar 280 kata, teks polos tanpa markdown, nada hangat dan tajam, tidak lebay."""
+
 VERDICT_ICONS = {"GAS": "🟢", "UJI": "🔵", "TUNDA": "🟡", "TOLAK": "🔴"}
 VERDICT_NAMES = {"GAS": "GAS", "UJI": "UJI KECIL", "TUNDA": "TUNDA", "TOLAK": "TOLAK"}
 
@@ -381,6 +401,8 @@ class State:
         self.paused_until: float = float(d.get("paused_until", 0) or 0)
         self.fail_count: int = int(d.get("fail_count", 0) or 0)
         self.last_alert: float = float(d.get("last_alert", 0) or 0)
+        self.next_inisiatif: float = float(d.get("next_inisiatif", 0) or 0)
+        self.last_inisiatif: float = float(d.get("last_inisiatif", 0) or 0)
 
     @classmethod
     def load(cls) -> "State":
@@ -680,6 +702,7 @@ class Verdict:
     vonis: str
     inti: str
     transcript: dict = field(default_factory=dict)
+    sources: list = field(default_factory=list)
 
 
 def parse_judge(raw: str, fallback_playbook: str) -> tuple[str, str, str, str]:
@@ -744,7 +767,7 @@ def convene_board(topic: str, origin: str, memory_ctx: str, profile_ctx: str) ->
     if sources:
         out += "\n\nSUMBER RISET:\n" + format_sources(sources)
     return Verdict(out, playbook, vonis, inti,
-                   {"scout": facts, "visionary": a1, "paranoid": a2, "hustler": a3, "treasurer": a4})
+                   {"scout": facts, "visionary": a1, "paranoid": a2, "hustler": a3, "treasurer": a4}, sources=sources)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1076,7 +1099,8 @@ WELCOME = (
     "/riset <topik> : riset web terkini plus sumber\n"
     "/premortem <rencana> : bedah kenapa rencana bisa gagal\n"
     "/draf <kebutuhan> : draf pesan/penawaran siap kirim\n"
-    "/debat : lihat perdebatan lengkap rapat terakhir\n\n"
+    "/debat : lihat perdebatan lengkap rapat terakhir\n"
+    "/obrolan : minta Dewan ngumpul dan lapor inisiatif mereka sekarang\n\n"
     "UANG & TARGET\n"
     "/catat +500rb jual kopi  atau  /catat -200rb bahan\n"
     "/dompet : ringkasan bulan ini dan progres target\n"
@@ -1099,6 +1123,7 @@ BOT_COMMANDS = [
     ("premortem", "Bedah kenapa rencana bisa gagal"),
     ("draf", "Draf pesan atau penawaran siap kirim"),
     ("debat", "Perdebatan lengkap rapat terakhir"),
+    ("obrolan", "Dewan ngumpul dan lapor inisiatif"),
     ("catat", "Catat pemasukan atau pengeluaran"),
     ("dompet", "Ringkasan uang bulan ini"),
     ("target", "Set target penghasilan bulanan"),
@@ -1308,6 +1333,20 @@ def build_bot(state: State) -> telebot.TeleBot:
             if _last_sources:
                 msg += "\n\nSUMBER:\n" + format_sources(_last_sources)
             send_long(bot, m.chat.id, msg)
+        guarded(m.chat.id, work)
+
+    @bot.message_handler(commands=["obrolan"])
+    def cmd_obrolan(m):
+        if not authorized(m.chat.id):
+            return
+        gap = time.time() - state.last_inisiatif
+        if state.last_inisiatif and gap < 2 * 3600:
+            send_long(bot, m.chat.id, f"Dewan baru ngumpul {int(gap // 60)} menit lalu, Bos. Tunggu sebentar lagi biar ada bahan baru.")
+            return
+
+        def work():
+            bot.send_message(m.chat.id, "🕯️ Siap Bos, Dewan ngumpul dulu ya. Bentar lagi kami lapor.")
+            run_initiative(bot, state)
         guarded(m.chat.id, work)
 
     @bot.message_handler(commands=["catat"])
@@ -1745,6 +1784,91 @@ def maybe_followup(bot: telebot.TeleBot, state: State) -> None:
             return
 
 
+def build_initiative_topic(state: State) -> str:
+    lines = ["TUGAS: Dewan berinisiatif sendiri, tanpa diminta Bos. Tentukan SATU langkah kemajuan paling "
+             "berdaya ungkit untuk Bos dalam 7 hari ke depan. Pilihan: mempercepat proyek yang sedang jalan, "
+             "memulai uji kecil baru yang cocok dengan profil dan modal Bos, atau memperbaiki arus uang. "
+             "Pilih yang paling realistis dan menguntungkan, dan pertimbangkan target serta uang nyata Bos."]
+    if not state.profile:
+        lines.append("CATATAN: Profil Bos masih kosong. Beri langkah umum yang aman, dan minta Bos menceritakan "
+                     "modal, keahlian, waktu luang, dan target lewat /ingat supaya saran berikutnya lebih tajam.")
+    running = [p.get("title", "?") for p in state.proposals.values() if p.get("fu_status") == "jalan"]
+    pending = [p.get("title", "?") for p in state.proposals.values() if p.get("status") == "pending"]
+    if running:
+        lines.append("PROYEK YANG SEDANG JALAN: " + "; ".join(running[:5]))
+    if pending:
+        lines.append("USULAN YANG MASIH MENGGANTUNG: " + "; ".join(pending[:5]))
+    top = sorted(state.digest, key=lambda x: -x.get("n", 0))[:5]
+    if top:
+        lines.append("TEMUAN MENARIK TERAKHIR DARI HUNTER: " + "; ".join(x["t"] for x in top))
+    if state.radar:
+        lines.append("TOPIK YANG BOS MINTA DIPANTAU: " + "; ".join(state.radar[:8]))
+    return "\n".join(lines)
+
+
+def run_initiative(bot: telebot.TeleBot, state: State) -> None:
+    """Rapat inisiatif: Dewan ngumpul sendiri, lalu Juru Bicara melapor dengan gaya obrolan."""
+    now = time.time()
+    v = convene_board(build_initiative_topic(state), "INISIATIF DEWAN (tanpa diminta Bos)",
+                      state.memory_context(), state.profile_context())
+    t = v.transcript
+    bahan = (f"RISET SCOUT:\n{t.get('scout') or '(tidak ada)'}\n\nVISIONARY:\n{t.get('visionary', '')}\n\n"
+             f"PARANOID:\n{t.get('paranoid', '')}\n\nHUSTLER:\n{t.get('hustler', '')}\n\n"
+             f"TREASURER:\n{t.get('treasurer', '')}\n\nPUTUSAN HAKIM:\n{v.report}\n\n"
+             f"PROFIL BOS:\n{state.profile_context()}\n\nTulis laporan obrolan Dewan untuk Bos.")
+    try:
+        story = clean(call_llm(NARRATOR_PROMPT, bahan, temperature=0.8, max_tokens=1600))
+    except LLMError as exc:
+        if "Kunci Gemini ditolak" in str(exc):
+            raise
+        story = v.report                      # cadangan: putusan biasa
+    pid = uuid.uuid4().hex[:8]
+    state.proposals[pid] = {
+        "ts": now, "status": "pending", "vonis": v.vonis, "playbook": v.playbook,
+        "title": ("Inisiatif Dewan: " + v.inti)[:160], "url": "", "src": "Inisiatif Dewan",
+    }
+    state.remember("Inisiatif Dewan: " + v.inti[:120], v.vonis, v.inti)
+    state.last_debate = pack_debate("Inisiatif Dewan", v)
+    state.hunt_log.append(now)
+    state.last_inisiatif = now
+    state.next_inisiatif = now + random.uniform(0.75, 1.5) * max(1, INISIATIF_JAM) * 3600
+    state.fail_count = 0
+
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("✅ GAS, EKSEKUSI", callback_data=f"sy:ok:{pid}"),
+        types.InlineKeyboardButton("🗑️ ABAIKAN", callback_data=f"sy:no:{pid}"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("⏰ Ingatkan besok", callback_data=f"sy:snz:{pid}"),
+        types.InlineKeyboardButton("🔎 Dalami", callback_data=f"sy:dig:{pid}"),
+    )
+    msg = f"{VERDICT_ICONS[v.vonis]} Bos, ada yang mau kami sampaikan.\n\n" + story
+    if v.sources:
+        msg += "\n\nSUMBER RISET:\n" + format_sources(v.sources)
+    msg += "\n\n(Perdebatan lengkap: /debat)"
+    send_long(bot, OWNER_CHAT_ID, msg, markup=kb)
+    state.save()
+
+
+def maybe_initiative(bot: telebot.TeleBot, state: State) -> bool:
+    """Jadwal acak sekitar sehari sekali, hanya di jam wajar (08-21 WIB). True bila rapat terjadi."""
+    if not INISIATIF_ENABLED or not state.profile:
+        return False
+    now = time.time()
+    if now < state.next_inisiatif or not (8 <= wib_now().hour <= 21):
+        return False
+    try:
+        run_initiative(bot, state)
+        return True
+    except LLMError as exc:
+        log.warning("Rapat inisiatif gagal: %s", exc)
+        _note_failure(bot, state, exc)
+        state.next_inisiatif = now + 3600        # coba lagi sejam kemudian, jangan boros kuota
+        state.save()
+        return False
+
+
 def maybe_reminders(bot: telebot.TeleBot, state: State) -> None:
     """Kirim pengingat yang sudah jatuh tempo (dicek tiap perburuan)."""
     now = time.time()
@@ -1867,6 +1991,13 @@ def run_hunt(bot: telebot.TeleBot, state: State) -> None:
         log.info("Batas rapat harian Hunter tercapai.")
         state.save()
         return
+
+    try:
+        if maybe_initiative(bot, state):     # Dewan baru saja ngumpul sendiri; berburu lanjut 30 menit lagi
+            state.save()
+            return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Inisiatif error: %s", type(exc).__name__)
 
     candidates = anomaly_hunter(state)
     state.last_hunt = now
