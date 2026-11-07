@@ -108,6 +108,11 @@ HUNT_TRENDS = _flag_env("HUNT_TRENDS", True)
 HUNT_PH = _flag_env("HUNT_PH", True)
 FOLLOWUP_DAYS = _int_env("FOLLOWUP_DAYS", 3)
 INISIATIF_ENABLED = _flag_env("INISIATIF_ENABLED", True)   # Dewan ngumpul sendiri dan lapor ke Bos
+KETUK_PER_HARI = _int_env("KETUK_PER_HARI", 16)            # batas ketukan per hari (bisa diubah lewat /ketukan)
+KETUK_MENIT = _int_env("KETUK_MENIT", 30)                  # jeda minimal antar ketukan
+KETUK_MIN = _int_env("KETUK_MIN", 6)                       # nilai Triage minimal agar jadi ketukan
+LOKASI_ENABLED = _flag_env("LOKASI_ENABLED", True)
+HUNTER_AUTO_RAPAT = _flag_env("HUNTER_AUTO_RAPAT", False)  # False: Hunter mengetuk dulu, rapat hanya bila Bos menekan Bahas
 INISIATIF_JAM = _int_env("INISIATIF_JAM", 24)              # rata-rata jeda antar inisiatif (acak 0,75x sampai 1,5x)
 MAX_PROFILE = 30
 MAX_RADAR = 30
@@ -180,7 +185,7 @@ PERANMU: THE SCOUT-PENYARING (penyaring sinyal).
 Kamu menerima daftar sinyal hasil perburuan. Beri tiap sinyal nilai 0 sampai 10 seberapa layak diperhatikan Bos. Pertimbangkan: potensi cuan atau keuntungan, kecocokan dengan profil dan target Bos, kebaruan, dan kemudahan untuk ditindaklanjuti. Pelajari pola dari riwayat klik Bos (yang disetujui dan yang dibuang).
 Nilai 7 ke atas hanya untuk yang benar-benar layak dirapatkan. Berita biasa, gosip, atau hal yang tidak bisa ditindaklanjuti dapat nilai rendah.
 Jawab HANYA dengan JSON valid, tanpa teks lain, dengan bentuk persis:
-{"hasil":[{"n":1,"nilai":8,"alasan":"satu kalimat singkat"}]}"""
+{"hasil":[{"n":1,"nilai":8,"alasan":"satu kalimat singkat","pitch":"1-2 kalimat bujukan yang jujur kenapa layak dibahas Bos, tanpa janji hasil pasti"}]}"""
 
 VISIONARY_PROMPT = DOCTRINE + """
 PERANMU: AGEN 1, THE VISIONARY (si pemikir besar).
@@ -245,7 +250,7 @@ RISIKO & PENANGKAL: <risiko terbesar dan cara menetralkannya>
 LANGKAH PERTAMA: <satu aksi di bawah 15 menit>
 BATAS AMAN: <kapan Bos harus berhenti, sertakan batas rugi>
 ===PLAYBOOK===
-<langkah eksekusi bernomor yang sudah disaring dari risiko; dikirim setelah Bos klik GAS>
+<PLAYBOOK RINCI yang dikirim setelah Bos klik GAS. Bagian ini boleh sampai sekitar 450 kata. Tulis langkah bernomor yang berurutan, tiap nomor satu misi yang bisa dikerjakan dalam sehari. Untuk tiap langkah sebutkan: apa persisnya yang dilakukan, alat atau bahan yang dipakai, contoh kalimat atau skrip bila perlu, dan tanda bahwa langkah itu berhasil. Tutup dengan baris "UKURAN KEBERHASILAN:" (angka yang menandakan ide ini jalan), "BATAS RUGI:", dan kapan Bos harus mengevaluasi ulang.>
 
 Arti vonis: GAS = jalankan penuh. UJI KECIL = jalankan versi murah dulu, naikkan hanya kalau terbukti. TUNDA = tunggu data atau waktu tertentu (sebutkan syaratnya). TOLAK = jauhi."""
 
@@ -462,6 +467,14 @@ class State:
         self.fail_count: int = int(d.get("fail_count", 0) or 0)
         self.last_alert: float = float(d.get("last_alert", 0) or 0)
         self.next_inisiatif: float = float(d.get("next_inisiatif", 0) or 0)
+        self.notes: list = list(d.get("notes", []))
+        self.spots: dict = dict(d.get("spots", {}))
+        self.ketuk_log: list = list(d.get("ketuk_log", []))
+        self.ketuk_max: int = int(d["ketuk_max"]) if "ketuk_max" in d else KETUK_PER_HARI
+        self.coach: list = list(d.get("coach", []))
+        self.last_review: str = str(d.get("last_review", ""))
+        self.last_local: float = float(d.get("last_local", 0) or 0)
+        self.lokasi_on: bool = bool(d.get("lokasi_on", True))
         self.mode: str = d.get("mode") if d.get("mode") in ("auto", "rapat", "jawab") else "auto"
         self.gaya: str = d.get("gaya") if d.get("gaya") in ("auto", "singkat", "sedang", "dalam") else "auto"
         self.qa: dict = dict(d.get("qa", {}))
@@ -503,6 +516,11 @@ class State:
         self.feedback = self.feedback[-40:]
         self.digest = self.digest[-40:]
         self.ledger = self.ledger[-400:]
+        self.notes = self.notes[-200:]
+        self.ketuk_log = [t for t in self.ketuk_log if now - t < 86400]
+        self.coach = self.coach[-5:]
+        if len(self.spots) > 80:
+            self.spots = dict(sorted(self.spots.items(), key=lambda kv: -kv[1].get("n", 0))[:80])
         if len(self.qa) > 10:
             self.qa = dict(sorted(self.qa.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:10])
         self.reminders = sorted(self.reminders, key=lambda r: r.get("due", 0))[:50]
@@ -678,9 +696,18 @@ def _candidates() -> list:
     return out
 
 
+def _build_contents(prompt: str, image: Optional[bytes], audio: Optional[bytes]):
+    parts = []
+    if image:
+        parts.append(gtypes.Part.from_bytes(data=image, mime_type="image/jpeg"))
+    if audio:
+        parts.append(gtypes.Part.from_bytes(data=audio, mime_type="audio/ogg"))
+    return parts + [prompt] if parts else prompt
+
+
 def call_llm(system: str, prompt: str, temperature: float = 0.8,
              max_tokens: int = 4096, retries: int = 3, search: bool = False,
-             image: Optional[bytes] = None) -> str:
+             image: Optional[bytes] = None, audio: Optional[bytes] = None) -> str:
     """Panggil Gemini; otomatis pindah model bila ditolak atau kuota habis.
     search=True mengaktifkan riset web (Google Search grounding); sumbernya di _last_sources."""
     global _good_model, _last_sources
@@ -705,8 +732,7 @@ def call_llm(system: str, prompt: str, temperature: float = 0.8,
                     cfg["tools"] = [gtypes.Tool(google_search=gtypes.GoogleSearch())]
                 resp = _get_client().models.generate_content(
                     model=model,
-                    contents=([gtypes.Part.from_bytes(data=image, mime_type="image/jpeg"), prompt]
-                              if image else prompt),
+                    contents=_build_contents(prompt, image, audio),
                     config=gtypes.GenerateContentConfig(**cfg),
                 )
                 text = (resp.text or "").strip()
@@ -848,6 +874,7 @@ class Signal:
     url: str
     snippet: str
     score: int
+    pitch: str = ""
 
     @property
     def uid(self) -> str:
@@ -1044,7 +1071,7 @@ def parse_triage(raw: str, n: int) -> dict:
         except (KeyError, TypeError, ValueError):
             continue
         if 1 <= k <= n:
-            out[k] = (max(0.0, min(10.0, v)), str(it.get("alasan", ""))[:140])
+            out[k] = (max(0.0, min(10.0, v)), str(it.get("alasan", ""))[:140], str(it.get("pitch", ""))[:260])
     if not out:
         raise ValueError("hasil kosong")
     return out
@@ -1072,7 +1099,7 @@ def triage(signals: list[Signal], state: State) -> list[tuple]:
     out = []
     for i, s in enumerate(signals, 1):
         if i in scores:
-            v, why = scores[i]
+            v, why, s.pitch = scores[i]
         else:   # cadangan bila Triage gagal: nilai dari skor kata kunci
             v, why = float(min(10, 5 + s.score)), "dinilai dari kata kunci"
         out.append((s, v, why))
@@ -1156,7 +1183,7 @@ WELCOME = (
     "👁️ Mata Dewan: bedah foto brosur, struk, harga, dan poster\n\n"
     "Kirim apa aja. Dewan membaca arah pesan Bos dulu: kalau Bos cuma mau tahu atau belajar, "
     "dijawab langsung tanpa embel-embel cuan. Kalau urusan usaha atau uang, baru Dewan rapat "
-    "dan Bos terima satu putusan. Foto dan tautan juga boleh.\n\n"
+    "dan Bos terima satu putusan. Foto, pesan suara, lokasi, dan tautan juga boleh.\n\n"
     "Arti warna putusan:\n"
     "🟢 GAS (jalan penuh)  🔵 UJI KECIL (coba murah dulu)\n"
     "🟡 TUNDA (tunggu syarat)  🔴 TOLAK (jauhi)\n\n"
@@ -1170,6 +1197,13 @@ WELCOME = (
     "/draf <kebutuhan> : draf pesan/penawaran siap kirim\n"
     "/debat : lihat perdebatan lengkap rapat terakhir\n"
     "/obrolan : minta Dewan ngumpul dan lapor inisiatif mereka sekarang\n\n"
+    "OTAK KEDUA\n"
+    "/simpan : simpan jawaban terakhir, atau /simpan judul | isi\n"
+    "/cari <kata> : cari catatan, /catatan : daftar, /hapus_catatan <nomor>\n\n"
+    "KETUKAN, MISI & LOKASI\n"
+    "/ketukan : atur seberapa sering Dewan mengetuk (24, on, off)\n"
+    "/misi : misi harian dari rencana yang Bos setujui\n"
+    "/lokasi : peta kebiasaan Bos dan peluang di sekitarnya\n\n"
     "UANG & TARGET\n"
     "/catat +500rb jual kopi  atau  /catat -200rb bahan\n"
     "/dompet : ringkasan bulan ini dan progres target\n"
@@ -1200,6 +1234,12 @@ BOT_COMMANDS = [
     ("draf", "Draf pesan atau penawaran siap kirim"),
     ("debat", "Perdebatan lengkap rapat terakhir"),
     ("obrolan", "Dewan ngumpul dan lapor inisiatif"),
+    ("simpan", "Simpan ke otak kedua"),
+    ("cari", "Cari di otak kedua"),
+    ("catatan", "Daftar otak kedua"),
+    ("ketukan", "Atur ketukan Dewan"),
+    ("misi", "Misi harian"),
+    ("lokasi", "Peta kebiasaan dan peluang sekitar"),
     ("catat", "Catat pemasukan atau pengeluaran"),
     ("dompet", "Ringkasan uang bulan ini"),
     ("target", "Set target penghasilan bulanan"),
@@ -1296,6 +1336,7 @@ def qa_markup(qid: str, cat: str):
                types.InlineKeyboardButton("🧒 Sederhanakan", callback_data=f"sy:qa_simple:{qid}"))
         kb.row(types.InlineKeyboardButton("📝 Uji saya", callback_data=f"sy:qa_quiz:{qid}"),
                types.InlineKeyboardButton("💼 Cuan-kan ini", callback_data=f"sy:qa_biz:{qid}"))
+        kb.row(types.InlineKeyboardButton("💾 Simpan ke otak kedua", callback_data=f"sy:qa_save:{qid}"))
     elif cat == "KEPUTUSAN":
         kb.row(types.InlineKeyboardButton("🏛️ Bawa ke rapat penuh", callback_data=f"sy:qa_biz:{qid}"))
     else:
@@ -1381,6 +1422,509 @@ def summarize_source(bot: telebot.TeleBot, chat_id: int, source: str, focus: str
         RINGKAS_PROMPT, f"<DATA>\n{label}\n{page}\n</DATA>\n\nFOKUS BOS: {focus or 'ringkas isinya'}",
         temperature=0.3, max_tokens=1400))
     send_long(bot, chat_id, "📄 " + ans)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  OTAK KEDUA: simpan, cari, dan ulang catatan dengan pengulangan berjarak
+# ════════════════════════════════════════════════════════════════════
+REVIEW_STEPS = [1, 3, 7, 14, 30, 60]
+
+
+def add_note(state: "State", q: str, a: str) -> dict:
+    now = time.time()
+    note = {"id": uuid.uuid4().hex[:8], "q": q.strip()[:300], "a": a.strip()[:1500],
+            "ts": now, "n": 0, "iv": 1, "next": now + 86400}
+    state.notes.append(note)
+    state.notes = state.notes[-200:]
+    return note
+
+
+def rate_note(note: dict, ingat: bool) -> int:
+    """Ingat: interval melebar (1,3,7,14,30,60 hari). Lupa: mulai lagi dari 1 hari. Kembalikan interval (hari)."""
+    if ingat:
+        note["n"] = int(note.get("n", 0)) + 1
+        iv = REVIEW_STEPS[min(note["n"], len(REVIEW_STEPS) - 1)]
+    else:
+        note["n"], iv = 0, 1
+    note["iv"] = iv
+    note["next"] = time.time() + iv * 86400
+    return iv
+
+
+def search_notes(state: "State", query: str, limit: int = 5) -> list:
+    words = set(re.findall(r"\w{3,}", (query or "").lower()))
+    if not words:
+        return []
+    scored = []
+    for n in state.notes:
+        q_, a_ = n["q"].lower(), n["a"].lower()
+        sc = sum((3 if w in q_ else 0) + a_.count(w) for w in words)
+        if sc > 0:
+            scored.append((sc, n))
+    scored.sort(key=lambda x: (-x[0], -x[1].get("ts", 0)))
+    return [n for _, n in scored[:limit]]
+
+
+def due_notes(state: "State") -> list:
+    now = time.time()
+    return sorted((n for n in state.notes if n.get("next", 0) <= now), key=lambda n: n.get("next", 0))
+
+
+def send_review(bot: telebot.TeleBot, state: "State", note: dict, extra: str = "") -> None:
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("👀 Lihat jawaban", callback_data=f"sy:nr_show:{note['id']}"))
+    send_long(bot, OWNER_CHAT_ID, f"🧠 Ulasan otak kedua{extra}\n\nMasih ingat jawaban ini, Bos?\n\n❓ {note['q']}", markup=kb)
+
+
+def maybe_note_review(bot: telebot.TeleBot, state: "State") -> None:
+    """Satu ulasan per hari, di jam wajar (09-20 WIB), kalau ada catatan yang jatuh tempo."""
+    now = wib_now()
+    today = now.strftime("%Y-%m-%d")
+    if not (9 <= now.hour <= 20) or state.last_review == today:
+        return
+    due = due_notes(state)
+    if not due:
+        return
+    extra = f" ({len(due)} catatan jatuh tempo)" if len(due) > 1 else ""
+    send_review(bot, state, due[0], extra)
+    state.last_review = today
+    state.save()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  KETUKAN: tawaran singkat dengan tombol Bahas / Abaikan (rapat penuh hanya bila Bos mau)
+# ════════════════════════════════════════════════════════════════════
+def decision_markup(pid: str):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("✅ GAS, EKSEKUSI", callback_data=f"sy:ok:{pid}"),
+           types.InlineKeyboardButton("🗑️ ABAIKAN", callback_data=f"sy:no:{pid}"))
+    kb.row(types.InlineKeyboardButton("⏰ Ingatkan besok", callback_data=f"sy:snz:{pid}"),
+           types.InlineKeyboardButton("🔎 Dalami", callback_data=f"sy:dig:{pid}"))
+    return kb
+
+
+def ketuk_allowed(state: "State") -> bool:
+    now = time.time()
+    state.ketuk_log = [t for t in state.ketuk_log if now - t < 86400]
+    if state.ketuk_max <= 0 or len(state.ketuk_log) >= state.ketuk_max:
+        return False
+    if state.ketuk_log and now - state.ketuk_log[-1] < KETUK_MENIT * 60 - 120:
+        return False
+    return True
+
+
+def send_teaser(bot: telebot.TeleBot, state: "State", title: str, pitch: str, nilai: float,
+                ctx: str, url: str = "", src: str = "Hunter") -> str:
+    now = time.time()
+    pid = uuid.uuid4().hex[:8]
+    state.proposals[pid] = {"ts": now, "status": "teaser", "title": title[:160], "url": url, "src": src[:60],
+                            "pitch": pitch[:600], "ctx": ctx[:3500], "vonis": "", "playbook": ""}
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("🔥 Bahas", callback_data=f"sy:bhs:{pid}"),
+           types.InlineKeyboardButton("🗑️ Abaikan", callback_data=f"sy:ign:{pid}"))
+    kb.row(types.InlineKeyboardButton("⏰ Nanti", callback_data=f"sy:snz:{pid}"))
+    msg = ("🔔 Ketukan dari Dewan\n\n"
+           "Bos, kalau kita bahas ini demi kemajuan dan keberhasilan Bos, mau nggak?\n\n"
+           f"📌 {title}\n💡 {pitch}\n📊 Potensi menurut Dewan: {nilai:.0f}/10\n\n"
+           "Kalau Bos mau, kami jabarkan langkahnya secara detail sampai ada hasil yang jelas. "
+           "Kalau nggak, tinggal abaikan.")
+    send_long(bot, OWNER_CHAT_ID, msg, markup=kb)
+    state.ketuk_log.append(now)
+    return pid
+
+
+def discuss_teaser(bot: telebot.TeleBot, state: "State", pid: str) -> None:
+    """Bos menekan Bahas: baru sekarang rapat penuh dijalankan."""
+    prop = state.proposals[pid]
+    topic = (prop.get("ctx", "") + "\n\nTUGAS KHUSUS: Bos MAU membahas ini. Susun rencana yang rinci dan "
+             "bisa dijalankan langkah demi langkah sampai ada hasil yang jelas.")
+    prop["status"] = "dibahas"
+    try:
+        v = convene_board(topic, "BOS MENERIMA KETUKAN DEWAN", state.memory_context(), state.profile_context())
+    except Exception:
+        prop["status"] = "teaser"
+        state.save()
+        raise
+    prop.update({"status": "pending", "vonis": v.vonis, "playbook": v.playbook})
+    state.remember(prop.get("title", "")[:150], v.vonis, v.inti)
+    state.last_debate = pack_debate(prop.get("title", ""), v)
+    state.save()
+    send_long(bot, OWNER_CHAT_ID,
+              f"{VERDICT_ICONS[v.vonis]} Siap Bos, ini hasil pembahasan Dewan.\n\n" + v.report
+              + "\n\n(Perdebatan lengkap: /debat)", markup=decision_markup(pid))
+
+
+def run_teasers(bot: telebot.TeleBot, state: "State", scored: list, now: float) -> None:
+    """Hunter tidak lagi rapat sendiri: temuan terbaik dikirim sebagai ketukan, Bos yang memutuskan."""
+    passing = [x for x in scored if x[1] >= KETUK_MIN]
+    for s_, v_, why_ in [x for x in scored if x[1] < KETUK_MIN]:
+        state.seen[s_.uid] = now
+        if v_ >= 3:
+            state.digest.append({"t": s_.title, "u": s_.url, "w": why_, "n": v_, "ts": now})
+    if not passing or not ketuk_allowed(state):
+        state.save()
+        return
+    lead, lead_v, lead_why = passing[0]
+    ctx = (f"SINYAL UTAMA: {lead.title}\nSumber: {lead.source}\nRingkasan: {lead.snippet}\nTautan: {lead.url}")
+    send_teaser(bot, state, lead.title, lead.pitch or lead_why, lead_v, ctx, lead.url, lead.source)
+    state.seen[lead.uid] = now
+    state.save()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PETA KEBIASAAN: tempat yang sering Bos lewati, lalu Hunter Lokal menganalisis sekitarnya
+# ════════════════════════════════════════════════════════════════════
+LOKAL_PROMPT = DOCTRINE + """
+PERANMU: PEMBACA PELUANG LOKAL.
+Kamu menerima data tempat yang sering Bos lewati (jumlah kunjungan dan jam-jamnya) beserta sensus usaha di sekitarnya dari OpenStreetMap. Cari celah usaha yang masuk akal untuk Bos di sekitar situ.
+Aturan keras:
+- Data OpenStreetMap di Indonesia sering TIDAK LENGKAP. "Belum ada" di data berarti "belum terpetakan", bukan bukti belum ada pesaing. Jadikan semuanya HIPOTESIS yang harus dicek Bos di lapangan.
+- Jangan mengarang nama tempat, jumlah penduduk, atau angka pasar. Kalau data peta tidak tersedia, katakan dan fokus pada cara Bos mengeceknya.
+- Pakai pola kunjungan Bos hanya sebagai petunjuk keberadaan lalu lintas orang, bukan bukti permintaan.
+Jawab PERSIS dengan format 4 baris ini (teks polos):
+NILAI: <angka 0-10, seberapa layak dibahas>
+PITCH: <1-2 kalimat bujukan yang jujur: celah apa yang kelihatan dan kenapa layak dibahas>
+CELAH: <satu kalimat: jenis usaha atau layanan yang kemungkinan kurang di sana>
+CEK LAPANGAN: <satu pengecekan di tempat yang bisa Bos lakukan dalam 15 menit>"""
+
+TRANSKRIP_PROMPT = ("Kamu juru ketik. Transkripkan audio yang diberikan APA ADANYA dalam bahasa yang diucapkan "
+                    "(umumnya Indonesia). Tulis hanya hasil transkrip tanpa komentar atau tanda kutip. "
+                    "Kalau tidak ada ucapan yang terdengar jelas, tulis persis: (tidak terdengar)")
+
+_SERVICE_GROUPS = ("warung makan", "kafe/kopi", "laundry", "apotek", "minimarket/kelontong", "fotokopi/print",
+                   "bengkel", "salon/barber", "ATM/bank", "fashion", "elektronik/HP")
+
+
+def spot_key(lat: float, lon: float) -> str:
+    return f"{lat:.3f},{lon:.3f}"          # ±110 m: sengaja kasar demi privasi
+
+
+def record_location(state: "State", lat: float, lon: float, label: str = "",
+                    ts: Optional[float] = None) -> tuple:
+    """Catat kunjungan. Kunjungan baru = jeda > 30 menit di titik yang sama."""
+    now = ts if ts is not None else time.time()
+    key = spot_key(lat, lon)
+    is_new = key not in state.spots
+    sp = state.spots.get(key) or {"lat": round(lat, 3), "lon": round(lon, 3), "n": 0, "hours": [0] * 24,
+                                  "days": [], "night": [], "label": "", "kind": "", "last": 0.0, "analyzed": 0.0}
+    local = datetime.fromtimestamp(now, WIB)
+    new_visit = now - float(sp.get("last", 0)) > 1800
+    if new_visit:
+        sp["n"] += 1
+        sp["hours"][local.hour] += 1
+        day = local.strftime("%Y%m%d")
+        if day not in sp["days"]:
+            sp["days"] = (sp["days"] + [day])[-60:]
+        if local.hour >= 22 or local.hour < 5:
+            if day not in sp["night"]:
+                sp["night"] = (sp["night"] + [day])[-30:]
+            if len(sp["night"]) >= 3 and not sp.get("kind"):
+                sp["kind"] = "rumah"          # otomatis dikecualikan dari analisis dan dari AI
+    sp["last"] = now
+    if label and not sp.get("label"):
+        sp["label"] = label[:80]
+    state.spots[key] = sp
+    return sp, new_visit, is_new
+
+
+def spots_ranked(state: "State") -> list:
+    return sorted(state.spots.items(), key=lambda kv: -kv[1].get("n", 0))
+
+
+def top_hours(sp: dict, k: int = 2) -> str:
+    hrs = sp.get("hours", [0] * 24)
+    best = sorted(range(24), key=lambda h: -hrs[h])[:k]
+    return ", ".join(f"{h:02d}.00" for h in best if hrs[h] > 0) or "belum jelas"
+
+
+def reverse_geocode(lat: float, lon: float) -> str:
+    """Nama area dari OpenStreetMap Nominatim (maks 1 permintaan per detik sesuai aturan layanan)."""
+    time.sleep(1.1)
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/reverse",
+                         params={"format": "jsonv2", "lat": lat, "lon": lon, "zoom": 17, "accept-language": "id"},
+                         headers={"User-Agent": "SyndicateBot/1.0 (asisten pribadi)"}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError):
+        return ""
+    a = data.get("address", {}) or {}
+    parts = [a.get("road") or a.get("neighbourhood") or a.get("suburb"),
+             a.get("village") or a.get("suburb") or a.get("city_district"),
+             a.get("city") or a.get("town") or a.get("county")]
+    label = ", ".join(dict.fromkeys(p for p in parts if p))
+    return (label or str(data.get("display_name", ""))[:80])[:80]
+
+
+def fetch_poi(lat: float, lon: float, radius: int = 300) -> Optional[list]:
+    q = (f'[out:json][timeout:20];('
+         f'node(around:{radius},{lat},{lon})["amenity"];node(around:{radius},{lat},{lon})["shop"];'
+         f'node(around:{radius},{lat},{lon})["office"];way(around:{radius},{lat},{lon})["amenity"];'
+         f'way(around:{radius},{lat},{lon})["shop"];);out tags 300;')
+    try:
+        r = requests.post("https://overpass-api.de/api/interpreter", data={"data": q},
+                          headers={"User-Agent": "SyndicateBot/1.0 (asisten pribadi)"}, timeout=30)
+        r.raise_for_status()
+        return list(r.json().get("elements", []))
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def poi_group(tags: dict) -> Optional[str]:
+    a, sh = tags.get("amenity"), tags.get("shop")
+    if a in ("restaurant", "fast_food", "food_court"):
+        return "warung makan"
+    if a == "cafe":
+        return "kafe/kopi"
+    if sh == "laundry" or a == "laundry":
+        return "laundry"
+    if a == "pharmacy" or sh == "chemist":
+        return "apotek"
+    if sh in ("convenience", "supermarket", "general", "kiosk"):
+        return "minimarket/kelontong"
+    if sh == "copyshop":
+        return "fotokopi/print"
+    if sh in ("car_repair", "motorcycle_repair", "motorcycle", "car_parts", "tyres"):
+        return "bengkel"
+    if sh in ("hairdresser", "barber", "beauty"):
+        return "salon/barber"
+    if a in ("atm", "bank"):
+        return "ATM/bank"
+    if sh in ("clothes", "shoes", "bag"):
+        return "fashion"
+    if sh in ("mobile_phone", "electronics", "computer"):
+        return "elektronik/HP"
+    if a in ("school", "kindergarten", "college", "university"):
+        return "DEMAND:sekolah/kampus"
+    if tags.get("office"):
+        return "DEMAND:perkantoran"
+    if a in ("hospital", "clinic", "doctors"):
+        return "DEMAND:klinik/RS"
+    if a == "marketplace" or sh == "mall":
+        return "DEMAND:pasar/pusat belanja"
+    if a in ("bus_station", "ferry_terminal") or tags.get("public_transport"):
+        return "DEMAND:transportasi"
+    return None
+
+
+def census(elements: list) -> dict:
+    counts: dict = {}
+    for el in elements or []:
+        g = poi_group(el.get("tags", {}) or {})
+        if g:
+            counts[g] = counts.get(g, 0) + 1
+    return counts
+
+
+def gap_hints(counts: dict) -> list:
+    """Layanan yang nol di data peta padahal ada pembangkit keramaian (sekolah, kantor, dst.)."""
+    demand = [g.split(":", 1)[1] for g, n in counts.items() if g.startswith("DEMAND:") and n > 0]
+    if not demand:
+        return []
+    return [f"belum terdata: {g} (ada {', '.join(demand)} di sekitar)" for g in _SERVICE_GROUPS
+            if counts.get(g, 0) == 0][:5]
+
+
+def parse_local(raw: str) -> dict:
+    out: dict = {}
+    key = None
+    for line in raw.splitlines():
+        m = re.match(r"^\s*(NILAI|PITCH|CELAH|CEK LAPANGAN)\s*:\s*(.*)$", line, re.I)
+        if m:
+            key = m.group(1).upper()
+            out[key] = m.group(2).strip()
+        elif key and line.strip():
+            out[key] += " " + line.strip()
+    try:
+        out["NILAI"] = float(re.search(r"\d+(?:[.,]\d+)?", out.get("NILAI", "")).group(0).replace(",", "."))
+    except (AttributeError, ValueError):
+        out["NILAI"] = 6.0
+    return out
+
+
+def pick_spot_for_analysis(state: "State") -> Optional[str]:
+    now = time.time()
+    for key, sp in spots_ranked(state):
+        if sp.get("kind") == "rumah" or sp.get("n", 0) < 3:
+            continue
+        if now - float(sp.get("analyzed", 0)) > 7 * 86400:
+            return key
+    return None
+
+
+def analyze_and_tease(bot: telebot.TeleBot, state: "State", key: str) -> bool:
+    """Analisis satu tempat lalu kirim ketukan. Koordinat TIDAK dikirim ke AI, hanya nama area."""
+    sp = state.spots[key]
+    if not sp.get("label"):
+        sp["label"] = reverse_geocode(sp["lat"], sp["lon"])
+    elements = fetch_poi(sp["lat"], sp["lon"])
+    counts = census(elements) if elements is not None else {}
+    if not sp.get("label") and not counts:
+        return False
+    hints = gap_hints(counts)
+    area = sp.get("label") or "area yang sering Bos lewati"
+    ctx_data = (f"TEMPAT: {area}\nBos singgah {sp.get('n', 0)} kali di {len(sp.get('days', []))} hari berbeda, "
+                f"jam tersering {top_hours(sp)}.\n"
+                f"SENSUS USAHA RADIUS 300 M (OpenStreetMap, sering tidak lengkap): "
+                f"{json.dumps(counts, ensure_ascii=False) if counts else 'data peta tidak tersedia'}\n"
+                f"PETUNJUK CELAH: {'; '.join(hints) if hints else 'tidak ada petunjuk jelas'}")
+    raw = clean(call_llm(LOKAL_PROMPT, f"<DATA>\n{ctx_data}\n</DATA>\n\nPROFIL BOS:\n{state.profile_context()}",
+                         temperature=0.6, max_tokens=900))
+    f = parse_local(raw)
+    sp["analyzed"] = time.time()
+    pitch = f.get("PITCH") or raw[:300]
+    if f.get("CELAH"):
+        pitch += f"\n🔎 Celah yang kelihatan: {f['CELAH']}"
+    if f.get("CEK LAPANGAN"):
+        pitch += f"\n🚶 Cek cepat 15 menit: {f['CEK LAPANGAN']}"
+    ctx = (f"PELUANG LOKAL DARI KEBIASAAN BOS\n{ctx_data}\n\nHIPOTESIS ANALIS LOKAL:\n{raw}\n\n"
+           "CATATAN: semua ini hipotesis dari data peta yang bisa tidak lengkap. Langkah pertama rencana WAJIB "
+           "berupa survei lapangan singkat untuk memverifikasi pesaing dan permintaan sebelum Bos mengeluarkan uang.")
+    send_teaser(bot, state, f"Peluang di sekitar {area}", pitch, f["NILAI"], ctx, "", "Peta Kebiasaan")
+    return True
+
+
+def maybe_local_teaser(bot: telebot.TeleBot, state: "State") -> None:
+    """Sehari sekali: beri nama tempat yang belum berlabel, lalu ketuk Bos soal peluang di tempat favoritnya."""
+    if not LOKASI_ENABLED or not state.lokasi_on or in_quiet_hours():
+        return
+    done = 0
+    for key, sp in spots_ranked(state):
+        if done >= 2:
+            break
+        if not sp.get("label") and sp.get("n", 0) >= 2 and sp.get("kind") != "rumah" and not sp.get("tried_label"):
+            sp["tried_label"] = True
+            sp["label"] = reverse_geocode(sp["lat"], sp["lon"])
+            done += 1
+    now = time.time()
+    if now - state.last_local < 20 * 3600 or not ketuk_allowed(state):
+        return
+    key = pick_spot_for_analysis(state)
+    if not key:
+        return
+    state.last_local = now
+    try:
+        analyze_and_tease(bot, state, key)
+    except LLMError as exc:
+        log.warning("Analisis lokal gagal: %s", exc)
+        state.spots[key]["analyzed"] = now - 6 * 86400       # coba lagi sekitar sehari kemudian
+    state.save()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PELATIH: misi harian dari playbook sampai ada hasil
+# ════════════════════════════════════════════════════════════════════
+def parse_steps(playbook: str) -> tuple:
+    """Pecah playbook bernomor jadi (daftar langkah, ekor berisi ukuran keberhasilan/batas rugi)."""
+    steps: list = []
+    tail_lines: list = []
+    cur = None
+    in_tail = False
+    for line in playbook.splitlines():
+        if re.match(r"^\s*(UKURAN KEBERHASILAN|BATAS RUGI|BATAS AMAN|EVALUASI)\b", line, re.I):
+            in_tail = True
+        if in_tail:
+            if line.strip():
+                tail_lines.append(line.strip())
+            continue
+        m = re.match(r"^\s*(\d{1,2})[.)]\s+(.*\S)", line)
+        if m:
+            if cur:
+                steps.append(cur)
+            cur = m.group(2)
+        elif cur and line.strip():
+            cur += " " + line.strip()
+    if cur:
+        steps.append(cur)
+    if not steps:
+        steps = [p.strip() for p in re.split(r"\n{2,}", playbook) if p.strip()]
+    return [s[:600] for s in steps][:30], " ".join(tail_lines)[:500]
+
+
+def start_coach(state: "State", pid: str, title: str, playbook: str) -> Optional[dict]:
+    steps, tail = parse_steps(playbook or "")
+    if not steps:
+        return None
+    state.coach = [c for c in state.coach if c["pid"] != pid]
+    track = {"pid": pid, "title": title[:120], "steps": steps, "tail": tail, "i": -1,
+             "acked": True, "day": "", "status": "aktif", "nag": 0}
+    state.coach.append(track)
+    state.coach = state.coach[-5:]
+    return track
+
+
+def maybe_coach(bot: telebot.TeleBot, state: "State") -> None:
+    """Satu misi per hari per proyek (07-20 WIB). Tidak maju sebelum misi sebelumnya Bos tutup."""
+    now = wib_now()
+    if not (7 <= now.hour <= 20):
+        return
+    today = now.strftime("%Y-%m-%d")
+    for c in state.coach:
+        if c.get("status") != "aktif" or c.get("day") == today:
+            continue
+        steps = c["steps"]
+        prefix = ""
+        if c.get("acked"):
+            c["i"] += 1
+            c["acked"], c["nag"] = False, 0
+        else:
+            c["nag"] = c.get("nag", 0) + 1
+            if c["nag"] > 4:
+                c["status"] = "berhenti"
+                send_long(bot, OWNER_CHAT_ID, f"⏸️ Misi untuk \"{c['title']}\" Dewan jeda karena sudah beberapa hari tanpa kabar. "
+                                              "Mau lanjut? Ketik /rapat diikuti kendalanya.")
+                state.save()
+                return
+            prefix = "⏰ Misi sebelumnya belum Bos tutup, ini pengingatnya:\n\n"
+        c["day"] = today
+        kb = types.InlineKeyboardMarkup()
+        if c["i"] >= len(steps):
+            kb.row(types.InlineKeyboardButton("🏆 Berhasil", callback_data=f"sy:co_win:{c['pid']}"),
+                   types.InlineKeyboardButton("🔁 Perlu iterasi", callback_data=f"sy:co_iter:{c['pid']}"))
+            kb.row(types.InlineKeyboardButton("🛑 Berhenti", callback_data=f"sy:co_stop:{c['pid']}"))
+            text = (f"🏁 Semua langkah untuk \"{c['title']}\" sudah dilewati. Gimana hasilnya, Bos?\n\n"
+                    + (f"Patokan keberhasilan dari rencana:\n{c['tail']}\n\n" if c.get("tail") else "")
+                    + "Catat hasil nyatanya pakai /catat supaya Dewan makin akurat, lalu pilih di bawah.")
+        else:
+            kb.row(types.InlineKeyboardButton("✅ Beres", callback_data=f"sy:co_ok:{c['pid']}"),
+                   types.InlineKeyboardButton("⏭️ Lewati", callback_data=f"sy:co_skip:{c['pid']}"))
+            kb.row(types.InlineKeyboardButton("🛑 Hentikan", callback_data=f"sy:co_stop:{c['pid']}"))
+            text = (f"{prefix}🎯 Misi hari ini ({c['i'] + 1}/{len(steps)}): {c['title']}\n\n{steps[c['i']]}\n\n"
+                    "Kalau sudah, tekan Beres. Kalau macet, ketik /rapat diikuti kendalanya biar Dewan carikan jalan.")
+        send_long(bot, OWNER_CHAT_ID, text, markup=kb)
+        state.save()
+        return
+
+
+INISIATIF_IDE_PROMPT = DOCTRINE + """
+PERANMU: PENCARI IDE KEMAJUAN.
+Dewan ingin mengetuk Bos dengan SATU ide kemajuan paling berdaya ungkit untuk 7 hari ke depan, berdasarkan data Bos. Jangan membahas lengkap: cukup tawaran singkat yang menggugah tapi jujur, tanpa janji hasil pasti.
+Jawab HANYA dengan JSON valid: {"judul":"judul ide singkat","pitch":"1-2 kalimat","nilai":7}"""
+
+
+def initiative_teaser(bot: telebot.TeleBot, state: "State") -> None:
+    """Versi ketukan dari Rapat Inisiatif: 1 panggilan AI. Rapat penuh baru jalan kalau Bos menekan Bahas."""
+    now = time.time()
+    topic = build_initiative_topic(state)
+    raw = call_llm(INISIATIF_IDE_PROMPT,
+                   f"<DATA>\n{topic}\n</DATA>\n\nPROFIL BOS:\n{state.profile_context()}\n\n"
+                   f"ARSIP:\n{state.memory_context()}", temperature=0.7, max_tokens=500)
+    try:
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    except (ValueError, json.JSONDecodeError):
+        data = {}
+    title = str(data.get("judul") or "Ide kemajuan minggu ini")[:120]
+    pitch = str(data.get("pitch") or clean(raw)[:300])
+    try:
+        nilai = float(data.get("nilai", 7))
+    except (TypeError, ValueError):
+        nilai = 7.0
+    state.last_inisiatif = now
+    state.next_inisiatif = now + random.uniform(0.75, 1.5) * max(1, INISIATIF_JAM) * 3600
+    state.fail_count = 0
+    send_teaser(bot, state, title, pitch, nilai, topic, "", "Inisiatif Dewan")
+    state.save()
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1513,6 +2057,198 @@ def build_bot(state: State) -> telebot.TeleBot:
             else:
                 send_long(bot, m.chat.id, "Teksnya terlalu pendek untuk diringkas, Bos. Kirim tautan atau tempel teks yang lebih panjang.")
         guarded(m.chat.id, work)
+
+    @bot.message_handler(commands=["simpan"])
+    def cmd_simpan(m):
+        if not authorized(m.chat.id):
+            return
+        arg = rest_of(m)
+        if arg:
+            q, _, a = arg.partition("|")
+            note = add_note(state, q if a.strip() else arg[:80], a if a.strip() else arg)
+        elif state.qa:
+            latest = max(state.qa.values(), key=lambda x: x.get("ts", 0))
+            note = add_note(state, latest["q"], latest["a"])
+        else:
+            send_long(bot, m.chat.id, "Belum ada jawaban yang bisa disimpan, Bos. Tanya sesuatu dulu, atau tulis /simpan judul | isi catatan.")
+            return
+        state.save()
+        send_long(bot, m.chat.id, f"🧠 Tersimpan di otak kedua: {note['q'][:80]}\nDewan akan mengulangnya besok, lalu 3, 7, 14, 30 hari lagi supaya nggak lupa.")
+
+    @bot.message_handler(commands=["cari"])
+    def cmd_cari(m):
+        if not authorized(m.chat.id):
+            return
+        found = search_notes(state, rest_of(m))
+        if not found:
+            send_long(bot, m.chat.id, "Nggak ada catatan yang cocok, Bos. Coba kata kunci lain, atau cek /catatan.")
+            return
+        send_long(bot, m.chat.id, "🔎 Catatan yang cocok:\n\n" + "\n\n".join(
+            f"{i}. {n['q']}\n   {n['a'][:200]}{'…' if len(n['a']) > 200 else ''}" for i, n in enumerate(found, 1)))
+
+    @bot.message_handler(commands=["catatan"])
+    def cmd_catatan(m):
+        if not authorized(m.chat.id):
+            return
+        if not state.notes:
+            send_long(bot, m.chat.id, "Otak kedua masih kosong, Bos. Simpan jawaban lewat tombol 💾 atau /simpan.")
+            return
+        recent = list(reversed(state.notes))[:10]
+        send_long(bot, m.chat.id, f"🧠 Otak kedua ({len(state.notes)} catatan, 10 terbaru):\n\n" + "\n".join(
+            f"{i}. {n['q'][:90]}" for i, n in enumerate(recent, 1))
+            + f"\n\nCatatan jatuh tempo diulang: {len(due_notes(state))}\nHapus: /hapus_catatan <nomor>")
+
+    @bot.message_handler(commands=["hapus_catatan"])
+    def cmd_hapus_catatan(m):
+        if not authorized(m.chat.id):
+            return
+        arg = rest_of(m)
+        recent = list(reversed(state.notes))[:10]
+        if not arg.isdigit() or not (1 <= int(arg) <= len(recent)):
+            send_long(bot, m.chat.id, "Nomornya nggak ada. Lihat daftar lewat /catatan.")
+            return
+        gone = recent[int(arg) - 1]
+        state.notes.remove(gone)
+        state.save()
+        send_long(bot, m.chat.id, f"Beres Bos, dihapus: {gone['q'][:80]}")
+
+    @bot.message_handler(commands=["ketukan"])
+    def cmd_ketukan(m):
+        if not authorized(m.chat.id):
+            return
+        arg = rest_of(m).lower()
+        if arg == "off":
+            state.ketuk_max = 0
+        elif arg == "on":
+            state.ketuk_max = KETUK_PER_HARI
+        elif arg.isdigit() and 1 <= int(arg) <= 96:
+            state.ketuk_max = int(arg)
+        elif arg:
+            send_long(bot, m.chat.id, "Pilihan: /ketukan 24 (maksimal per hari), /ketukan on, /ketukan off")
+            return
+        state.save()
+        n = sum(1 for t in state.ketuk_log if time.time() - t < 86400)
+        send_long(bot, m.chat.id,
+                  "🔔 Ketukan Dewan\n"
+                  f"Batas per hari: {state.ketuk_max if state.ketuk_max > 0 else 'mati'}\n"
+                  f"Terkirim 24 jam terakhir: {n}\n"
+                  f"Jeda minimal antar ketukan: {KETUK_MENIT} menit\n\n"
+                  "Ubah: /ketukan 24, /ketukan on, /ketukan off. Hunter sendiri berjalan tiap 30 menit.")
+
+    @bot.message_handler(commands=["misi"])
+    def cmd_misi(m):
+        if not authorized(m.chat.id):
+            return
+        if not state.coach:
+            send_long(bot, m.chat.id, "Belum ada misi. Misi harian muncul otomatis setelah Bos klik GAS pada suatu rencana.")
+            return
+        lines = ["🎯 Misi Bos:\n"]
+        for c in state.coach:
+            st_ = {"aktif": "🔥 aktif", "selesai": "🏆 selesai", "berhenti": "⏸️ berhenti"}.get(c.get("status"), c.get("status"))
+            lines.append(f"• {c['title']}\n  {st_} | langkah {min(max(c['i'], 0) + 1, len(c['steps']))}/{len(c['steps'])}")
+        send_long(bot, m.chat.id, "\n".join(lines))
+
+    @bot.message_handler(commands=["lokasi"])
+    def cmd_lokasi(m):
+        if not authorized(m.chat.id):
+            return
+        a = args_of(m)
+        sub = a[1].lower() if len(a) > 1 else ""
+        arg = a[2].strip() if len(a) > 2 else ""
+        ranked = spots_ranked(state)
+        if sub == "hapus":
+            state.spots.clear()
+            state.save()
+            send_long(bot, m.chat.id, "🧹 Semua riwayat tempat dihapus, Bos.")
+            return
+        if sub in ("on", "off"):
+            state.lokasi_on = sub == "on"
+            state.save()
+            send_long(bot, m.chat.id, "📍 Pencatatan lokasi " + ("dinyalakan." if state.lokasi_on else "dimatikan. Lokasi yang Bos kirim akan diabaikan."))
+            return
+        if sub in ("rumah", "lupa") and arg.isdigit() and 1 <= int(arg) <= len(ranked):
+            key, sp = ranked[int(arg) - 1]
+            if sub == "rumah":
+                sp["kind"] = "rumah"
+                msg_ = "🏠 Ditandai sebagai rumah: dikecualikan dari analisis dan tidak pernah dikirim ke AI."
+            else:
+                state.spots.pop(key, None)
+                msg_ = "Dihapus dari riwayat."
+            state.save()
+            send_long(bot, m.chat.id, msg_)
+            return
+        if sub == "analisa":
+            def work():
+                key = pick_spot_for_analysis(state)
+                if not key:
+                    send_long(bot, m.chat.id, "Belum ada tempat yang cukup sering Bos kunjungi (minimal 3 kali) atau semuanya baru dianalisis.")
+                    return
+                if not analyze_and_tease(bot, state, key):
+                    send_long(bot, m.chat.id, "Data peta untuk tempat itu belum tersedia, Bos. Coba lagi nanti.")
+                state.save()
+            guarded(m.chat.id, work)
+            return
+        if not ranked:
+            send_long(bot, m.chat.id,
+                      "📍 Belum ada riwayat tempat.\n\nCara mengisinya: kirim lokasi lewat Telegram (📎 lalu Lokasi), atau nyalakan "
+                      "Bagikan Lokasi Langsung (Live Location) saat Bos keluar rumah. Dewan mencatat tempat yang sering Bos "
+                      "lewati, lalu mencari celah usaha di sekitarnya.")
+            return
+        lines = [f"📍 Peta kebiasaan Bos ({'aktif' if state.lokasi_on else 'dimatikan'}), {len(ranked)} tempat:\n"]
+        for i, (_, sp) in enumerate(ranked[:8], 1):
+            tag = " 🏠 (dikecualikan)" if sp.get("kind") == "rumah" else ""
+            lines.append(f"{i}. {sp.get('label') or 'tanpa nama'}{tag}\n   {sp.get('n', 0)}x singgah, jam tersering {top_hours(sp)}")
+        lines.append("\n/lokasi analisa : cari peluang di tempat favorit sekarang\n/lokasi rumah <nomor> : tandai rumah\n"
+                     "/lokasi lupa <nomor> : hapus satu tempat\n/lokasi hapus : hapus semua\n/lokasi off : berhenti mencatat")
+        send_long(bot, m.chat.id, "\n".join(lines))
+
+    def handle_location(m, silent: bool) -> None:
+        if not authorized(m.chat.id) or not state.lokasi_on or not LOKASI_ENABLED:
+            return
+        loc = m.location
+        venue = getattr(m, "venue", None)
+        label = str(venue.title)[:80] if venue is not None and getattr(venue, "title", None) else ""
+        sp, new_visit, is_new = record_location(state, loc.latitude, loc.longitude, label)
+        if not silent and not sp.get("label"):
+            sp["label"] = reverse_geocode(sp["lat"], sp["lon"])
+        state.save()
+        if not silent:
+            home = " (otomatis ditandai rumah, tidak dianalisis)" if sp.get("kind") == "rumah" else ""
+            send_long(bot, m.chat.id, f"📍 Dicatat: {sp.get('label') or 'titik baru'}{home}\nSudah {sp['n']}x Bos singgah di sini. "
+                                      "Lihat semuanya lewat /lokasi.")
+
+    @bot.message_handler(content_types=["location", "venue"])
+    def on_location(m):
+        handle_location(m, silent=False)
+
+    @bot.edited_message_handler(content_types=["location"])
+    def on_live_location(m):
+        handle_location(m, silent=True)
+
+    @bot.message_handler(content_types=["voice"])
+    def on_voice(m):
+        if setup_hint(m) or not authorized(m.chat.id):
+            return
+        box: list = []
+
+        def work():
+            if getattr(m.voice, "duration", 0) and m.voice.duration > 180:
+                send_long(bot, m.chat.id, "Pesan suaranya kepanjangan, Bos (maksimal 3 menit). Pecah jadi beberapa bagian ya.")
+                return
+            info = bot.get_file(m.voice.file_id)
+            data = bot.download_file(info.file_path)
+            if not data or len(data) > 5_000_000:
+                send_long(bot, m.chat.id, "Gagal mengunduh pesan suaranya atau kebesaran, Bos. Coba kirim ulang.")
+                return
+            text = clean(call_llm(TRANSKRIP_PROMPT, "Transkripkan audio ini.", temperature=0.0, max_tokens=1500, audio=data))
+            if not text or "(tidak terdengar)" in text:
+                send_long(bot, m.chat.id, "Suaranya kurang jelas, Bos. Coba rekam ulang atau ketik saja.")
+                return
+            send_long(bot, m.chat.id, "🎙️ Terdengar: " + text)
+            box.append(text[:MAX_USER_CHARS])
+        guarded(m.chat.id, work)
+        if box:
+            respond(m.chat.id, box[0])
 
     @bot.message_handler(commands=["start", "help", "bantuan"])
     def cmd_start(m):
@@ -1952,6 +2688,11 @@ def build_bot(state: State) -> telebot.TeleBot:
             safe_answer(bot, c.id, "Siap Bos.")
             base = f"PERTANYAAN ASLI BOS:\n{item['q']}\n\nJAWABAN SEBELUMNYA:\n{item['a']}\n\n"
             qa_system = TEKNISI_PROMPT if item.get("cat") == "TEKNIS" else GURU_PROMPT
+            if action == "qa_save":
+                add_note(state, item["q"], item["a"])
+                state.save()
+                send_long(bot, chat, "🧠 Tersimpan di otak kedua. Dewan ulang besok, lalu 3, 7, 14, 30 hari lagi biar nggak lupa.")
+                return
 
             def qa_work():
                 if action == "qa_deep":
@@ -1983,6 +2724,62 @@ def build_bot(state: State) -> telebot.TeleBot:
                     send_long(bot, chat, v.report)
             guarded(chat, qa_work)
             return
+        if action.startswith("nr_"):
+            note = next((n for n in state.notes if n["id"] == pid), None)
+            if not note:
+                safe_answer(bot, c.id, "Catatan itu sudah tidak ada.")
+                return
+            safe_answer(bot, c.id, "Siap.")
+            try:
+                bot.edit_message_reply_markup(chat, c.message.message_id, reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+            if action == "nr_show":
+                kb = types.InlineKeyboardMarkup()
+                kb.row(types.InlineKeyboardButton("✅ Ingat", callback_data=f"sy:nr_ok:{pid}"),
+                       types.InlineKeyboardButton("😵 Lupa", callback_data=f"sy:nr_bad:{pid}"))
+                kb.row(types.InlineKeyboardButton("🗑️ Hapus catatan", callback_data=f"sy:nr_del:{pid}"))
+                send_long(bot, chat, "💡 Jawabannya:\n\n" + note["a"] + "\n\nSeberapa ingat tadi?", markup=kb)
+            elif action in ("nr_ok", "nr_bad"):
+                iv = rate_note(note, action == "nr_ok")
+                state.save()
+                send_long(bot, chat, ("✅ Mantap Bos." if action == "nr_ok" else "😵 Nggak apa-apa Bos, wajar.")
+                          + f" Dewan ulang lagi {iv} hari lagi.")
+                nxt = [n for n in due_notes(state) if n["id"] != pid]
+                if nxt:
+                    send_review(bot, state, nxt[0], " (berikutnya)")
+            else:
+                state.notes.remove(note)
+                state.save()
+                send_long(bot, chat, "🗑️ Catatan dihapus dari otak kedua.")
+            return
+        if action.startswith("co_"):
+            track = next((t for t in state.coach if t["pid"] == pid), None)
+            if not track:
+                safe_answer(bot, c.id, "Misi itu sudah tidak ada.")
+                return
+            safe_answer(bot, c.id, "Siap Bos.")
+            try:
+                bot.edit_message_reply_markup(chat, c.message.message_id, reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+            if action in ("co_ok", "co_skip"):
+                track["acked"] = True
+                state.add_feedback(track["title"], "misi beres" if action == "co_ok" else "misi dilewati")
+                send_long(bot, chat, ("🔥 Mantap Bos!" if action == "co_ok" else "⏭️ Oke, dilewati.") + " Misi berikutnya muncul besok.")
+            elif action == "co_win":
+                track["status"] = "selesai"
+                state.add_feedback(track["title"], "berhasil")
+                send_long(bot, chat, "🏆 Luar biasa Bos! Catat hasil nyatanya lewat /catat, lalu kirim /obrolan kalau mau Dewan mikirin langkah berikutnya.")
+            elif action == "co_iter":
+                track["status"] = "berhenti"
+                send_long(bot, chat, "🔁 Oke Bos. Ceritakan apa yang terjadi dan hasilnya lewat /rapat <ceritanya>, biar Dewan merevisi rencananya.")
+            else:
+                track["status"] = "berhenti"
+                state.add_feedback(track["title"], "misi dihentikan")
+                send_long(bot, chat, "🛑 Misi dihentikan, Bos. Dewan lanjut mencari yang lebih cocok.")
+            state.save()
+            return
         prop = state.proposals.get(pid)
         if not prop:
             safe_answer(bot, c.id, "Usulan ini sudah kedaluwarsa.")
@@ -2010,6 +2807,33 @@ def build_bot(state: State) -> telebot.TeleBot:
                     msg += "\n\nSUMBER:\n" + format_sources(_last_sources)
                 send_long(bot, chat, msg)
             guarded(chat, dig_work)
+            return
+        if action == "ign":
+            try:
+                bot.edit_message_reply_markup(chat, c.message.message_id, reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+            prop["status"] = "ignored"
+            state.add_feedback(prop.get("title", "ketukan"), "dibuang", prop.get("src", ""))
+            safe_answer(bot, c.id, "Dibuang.")
+            state.save()
+            send_long(bot, chat, "🗑️ Oke Bos, dibuang. Dewan belajar dari pilihan Bos.")
+            return
+        if action == "bhs":
+            if prop.get("status") != "teaser":
+                safe_answer(bot, c.id, "Ini sudah dibahas atau dibuang.")
+                return
+            safe_answer(bot, c.id, "Siap, Dewan bahas sekarang.")
+            try:
+                bot.edit_message_reply_markup(chat, c.message.message_id, reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+            state.add_feedback(prop.get("title", "ketukan"), "dibahas", prop.get("src", ""))
+
+            def bhs_work():
+                bot.send_message(chat, "🕯️ Siap Bos, Dewan bahas ini sekarang. Bentar ya, hasilnya lengkap dengan langkah detailnya.")
+                discuss_teaser(bot, state, pid)
+            guarded(chat, bhs_work)
             return
         try:
             bot.edit_message_reply_markup(chat, c.message.message_id, reply_markup=None)
@@ -2057,6 +2881,8 @@ def build_bot(state: State) -> telebot.TeleBot:
                 warn = ""
             if vonis in ("GAS", "UJI"):
                 warn += f"\n\n⏰ Dewan bakal nanyain progresnya {FOLLOWUP_DAYS} hari lagi."
+                if start_coach(state, pid, title, prop.get("playbook", "")):
+                    warn += "\n\n🎯 Mulai dari sini Dewan kirim misi harian dari playbook ini sampai ada hasil. Lihat /misi."
             send_long(bot, chat, "✅ Siap Bos, ini playbook eksekusinya:\n\n" + prop["playbook"] + warn)
         else:
             prop["status"] = "ignored"
@@ -2225,7 +3051,12 @@ def maybe_initiative(bot: telebot.TeleBot, state: State) -> bool:
     if now < state.next_inisiatif or not (8 <= wib_now().hour <= 21):
         return False
     try:
-        run_initiative(bot, state)
+        if HUNTER_AUTO_RAPAT:
+            run_initiative(bot, state)
+        else:
+            if not ketuk_allowed(state):
+                return False
+            initiative_teaser(bot, state)
         return True
     except LLMError as exc:
         log.warning("Rapat inisiatif gagal: %s", exc)
@@ -2342,7 +3173,8 @@ def run_hunt(bot: telebot.TeleBot, state: State) -> None:
         log.info("Hunter dijeda oleh Bos.")
         state.save()
         return
-    for task in (maybe_morning_brief, maybe_weekly_review, maybe_followup, maybe_digest):
+    for task in (maybe_morning_brief, maybe_weekly_review, maybe_followup, maybe_digest,
+                 maybe_note_review, maybe_coach, maybe_local_teaser):
         try:
             task(bot, state)
         except Exception as exc:  # noqa: BLE001
@@ -2353,13 +3185,14 @@ def run_hunt(bot: telebot.TeleBot, state: State) -> None:
         state.save()
         return
     state.hunt_log = [t for t in state.hunt_log if now - t < 86400]
-    if len(state.hunt_log) >= MAX_HUNT_SIDANG_PER_DAY:
+    capped = len(state.hunt_log) >= MAX_HUNT_SIDANG_PER_DAY
+    if capped and HUNTER_AUTO_RAPAT:
         log.info("Batas rapat harian Hunter tercapai.")
         state.save()
         return
 
     try:
-        if maybe_initiative(bot, state):     # Dewan baru saja ngumpul sendiri; berburu lanjut 30 menit lagi
+        if not capped and maybe_initiative(bot, state):     # Dewan baru saja ngumpul sendiri; berburu lanjut 30 menit lagi
             state.save()
             return
     except Exception as exc:  # noqa: BLE001
@@ -2377,6 +3210,9 @@ def run_hunt(bot: telebot.TeleBot, state: State) -> None:
         log.error("Triage gagal: %s", exc)
         _note_failure(bot, state, exc)
         state.save()
+        return
+    if not HUNTER_AUTO_RAPAT:
+        run_teasers(bot, state, scored, now)
         return
     passing = [x for x in scored if x[1] >= TRIAGE_MIN]
     low = [x for x in scored if x[1] < TRIAGE_MIN]
