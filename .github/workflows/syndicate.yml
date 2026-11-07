@@ -57,6 +57,11 @@ jobs:
           SCOUT_ENABLED: ${{ vars.SCOUT_ENABLED }}
           INISIATIF_ENABLED: ${{ vars.INISIATIF_ENABLED }}
           INISIATIF_JAM: ${{ vars.INISIATIF_JAM }}
+          KETUK_PER_HARI: ${{ vars.KETUK_PER_HARI }}
+          KETUK_MENIT: ${{ vars.KETUK_MENIT }}
+          KETUK_MIN: ${{ vars.KETUK_MIN }}
+          LOKASI_ENABLED: ${{ vars.LOKASI_ENABLED }}
+          HUNTER_AUTO_RAPAT: ${{ vars.HUNTER_AUTO_RAPAT }}
 
       - uses: actions/cache/save@v4
         if: always()
