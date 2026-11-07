@@ -1,5 +1,7 @@
 // Gerbang Syndicate: Telegram -> Netlify -> GitHub Actions.
 // Menolak semua yang bukan dari Telegram asli & bukan dari Bos.
+let lastLive = 0; // pembatas Live Location: maksimal 1 pembaruan diteruskan per 10 menit (per instance)
+
 exports.handler = async (event) => {
   const OK = { statusCode: 200, body: "ok" };
   try {
@@ -11,7 +13,8 @@ exports.handler = async (event) => {
     }
 
     const update = JSON.parse(event.body || "{}");
-    const msg = update.message || (update.callback_query && update.callback_query.message);
+    const edited = update.edited_message;
+    const msg = update.message || edited || (update.callback_query && update.callback_query.message);
     const chatId = msg && msg.chat && msg.chat.id;
     if (!chatId) return OK;
 
@@ -34,14 +37,21 @@ exports.handler = async (event) => {
     }
     if (String(chatId) !== owner) return OK; // orang asing diabaikan total
 
-    // Umpan balik instan agar Bos tidak menunggu dalam gelap
+    const m = update.message;
     if (update.callback_query) {
       await tg("answerCallbackQuery", {
         callback_query_id: update.callback_query.id,
         text: "Titah diterima. Dewan memproses...",
       });
-    } else if (update.message && (update.message.text || update.message.photo)) {
-      await tg("sendChatAction", { chat_id: chatId, action: "typing" });
+    } else if (m && (m.text || m.photo || m.voice || m.location || m.venue)) {
+      if (m.text || m.photo || m.voice) {
+        await tg("sendChatAction", { chat_id: chatId, action: "typing" });
+      }
+    } else if (edited && edited.location) {
+      // pembaruan Live Location: jangan banjiri GitHub Actions
+      const now = Date.now();
+      if (now - lastLive < 10 * 60 * 1000) return OK;
+      lastLive = now;
     } else {
       return OK;
     }
